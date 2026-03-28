@@ -33,19 +33,15 @@ results from recent papers.
 
 Registered PyTorch forward hooks on all 32 LLaDA-8B-Instruct layers to
 collect Attention Output and FFN Output activations across 10 denoising
-steps. Two complementary analyses were performed: single-step similarity
-(reproducing dLLM-Cache's core finding) and full-trajectory similarity
-(tracking dynamics across all 9 adjacent step pairs).
+steps. Two complementary analyses: single-step similarity (reproducing
+dLLM-Cache's core finding) and full-trajectory similarity (all 9 adjacent
+step pairs).
 
-**Key findings**:
-- Prompt tokens quasi-static throughout (ρ̄ ≈ 0.93–0.98), response tokens
-  more dynamic (ρ̄ ≈ 0.67–0.77) — validating dLLM-Cache's differentiated
-  caching design
-- Sharp similarity drop at Step 6→7 reveals a critical state transition
-  mid-denoising, motivating adaptive (rather than fixed-interval) cache
-  refresh as in DLLM-CACHE
-- Deeper layers (24–31) show consistently lower similarity than shallow
-  layers, suggesting layer-wise caching granularity is worthwhile
+**Key findings**: Prompt tokens quasi-static (ρ̄ ≈ 0.93–0.98), response
+tokens more dynamic (ρ̄ ≈ 0.67–0.77). Sharp similarity drop at Step 6→7
+reveals a critical state transition mid-denoising, motivating adaptive
+cache refresh as in DLLM-CACHE. Deeper layers (24–31) show consistently
+lower similarity than shallow layers.
 
 ![Similarity over Steps](activation_analysis/similarity_over_steps.png)
 
@@ -54,8 +50,7 @@ steps. Two complementary analyses were performed: single-step similarity
 ### 2. Quantization Comparison: FP16 vs INT8 vs INT4
 [`quantization_comparison/`](quantization_comparison/)
 
-Benchmarked three quantization precisions on Qwen2.5-0.5B-Instruct using
-bitsandbytes, measuring VRAM usage, generation speed, and output quality.
+Benchmarked three precisions on Qwen2.5-0.5B using bitsandbytes.
 
 | Precision | VRAM | Speed (tok/s) | Quality |
 |-----------|------|---------------|---------|
@@ -63,51 +58,58 @@ bitsandbytes, measuring VRAM usage, generation speed, and output quality.
 | INT8 | 0.60 GB | 12.0 | Comparable |
 | INT4 (NF4) | 0.44 GB | 32.8 | Comparable |
 
-**Finding**: INT8 is slower than INT4 on small models — bitsandbytes
-dequantizes INT8 weights to FP16 before matrix multiplication, adding
-overhead that dominates when compute demand is low.
+**Finding**: INT8 is slower than INT4 — bitsandbytes dequantizes INT8
+weights to FP16 before matrix multiply, adding overhead that dominates
+for small models with low compute demand.
 
 ---
 
 ### 3. LoRA Fine-tuning: Parameter-Efficient SFT
 [`lora_finetuning/`](lora_finetuning/)
 
-Applied QLoRA (INT4 quantization + LoRA adapters) to fine-tune
-Qwen2.5-0.5B on 200 Alpaca samples for 100 steps.
-
-| | Parameters | % of Total |
-|--|-----------|------------|
-| Full model | 315,119,488 | 100% |
-| LoRA trainable | 540,672 | **0.17%** |
-
-Loss dropped from 14.48 → 0.71. Model learned concise instruction-following
-style from Alpaca with only 0.17% of parameters updated.
+Applied QLoRA (INT4 + LoRA) to fine-tune Qwen2.5-0.5B on 200 Alpaca
+samples for 100 steps. Only 0.17% of parameters trained (540K / 315M).
+Loss dropped from 14.48 → 0.71, model learned concise instruction-following
+style from Alpaca.
 
 ---
 
-### 4. vLLM Serving: PagedAttention vs HuggingFace
-[`vllm_serving/`](vllm_serving/)
+### 4. Knowledge Distillation: Teacher → Student
+[`knowledge_distillation/`](knowledge_distillation/)
 
-Compared throughput between sequential HuggingFace inference and vLLM's
-PagedAttention + Continuous Batching on 5 concurrent requests.
+Distilled Qwen2.5-1.5B (Teacher) into Qwen2.5-0.5B (Student) using three
+modes: hard label SFT, soft label KD (T=4.0), and mixed (α=0.5).
 
-| Method | Throughput | Speedup |
-|--------|-----------|---------|
-| HuggingFace (sequential) | 50.3 tok/s | 1x |
-| vLLM (PagedAttention) | 817.0 tok/s | **16x** |
+**Finding**: Soft labels transmit the Teacher's response *style*, not just
+the correct answer. Student trained with soft labels produces more detailed
+outputs resembling the Teacher — demonstrating that soft labels carry
+"dark knowledge" beyond what one-hot labels provide.
 
-**Finding**: PagedAttention eliminates KV Cache memory fragmentation
-(60–80% waste in naive implementations), enabling near-zero fragmentation
-and 695× maximum concurrency on 8GB VRAM.
+![KD Benchmark](knowledge_distillation/kd_benchmark.png)
 
 ---
 
-### 5. Flash Attention Benchmark
+### 5. Early Exit Analysis: Layer-wise Representation Stability
+[`early_exit/`](early_exit/)
+
+Analyzed inter-layer hidden state similarity and L2 change across all 24
+layers of Qwen2.5-0.5B to identify potential early exit points.
+
+**Finding**: Every layer makes a meaningful contribution (cosine similarity
+stays 0.83–0.97, never reaching 0.99 threshold). Final two layers show
+dramatic L2 spikes (~300 vs ~15 for earlier layers) — they are critical
+decision layers. Early Exit has limited benefit for compact models;
+it is more valuable for 70B+ models where genuine redundant layers exist.
+
+![Early Exit Analysis](early_exit/early_exit_analysis.png)
+
+---
+
+### 6. Flash Attention Benchmark
 [`flash_attention/`](flash_attention/)
 
-Benchmarked standard attention (explicit HBM read/write of N×N matrices)
-against Flash Attention (SRAM tiling, no N×N materialization) across
-sequence lengths 128–2048.
+Benchmarked standard attention vs Flash Attention (PyTorch built-in)
+across sequence lengths 128–2048.
 
 | Sequence Length | Standard (ms) | Flash (ms) | Speedup |
 |----------------|--------------|------------|---------|
@@ -115,26 +117,74 @@ sequence lengths 128–2048.
 | 512 | 0.09 | 0.05 | 1.92x |
 | 2048 | 0.18 | 0.10 | 1.71x |
 
+**Connection to dLLM**: Standard Flash Attention requires causal masking.
+dLLMs use bidirectional attention, breaking this assumption. Fast-dLLM V2's
+Block-Causal Mask recovers Flash Attention compatibility while preserving
+bidirectional generation.
+
 ![Flash Attention Benchmark](flash_attention/flash_attention_benchmark.png)
 
-**Connection to dLLM**: Standard Flash Attention requires causal masking
-for its streaming tiling strategy. dLLMs use bidirectional attention,
-breaking this assumption. Fast-dLLM V2's Block-Causal Mask recovers Flash
-Attention compatibility while preserving bidirectional generation.
+---
+
+### 7. vLLM Batch Scaling
+[`vllm_batch_scaling/`](vllm_batch_scaling/)
+
+Measured throughput and latency across batch sizes 1–64 with vLLM's
+PagedAttention + Continuous Batching.
+
+| Batch | Throughput (tok/s) | Latency (ms/req) |
+|-------|-------------------|-----------------|
+| 1 | 191 | 262 |
+| 8 | 1,602 | 31 |
+| 64 | **9,120** | 6 |
+
+**Finding**: Near-linear throughput scaling — each doubling of batch size
+roughly doubles throughput. GPU is not saturated even at batch=64, because
+decode is memory-bound and larger batches better amortize weight reads.
+
+![Batch Scaling](vllm_batch_scaling/batch_scaling.png)
+
+---
+
+### 8. Inference Acceleration Comparison
+[`inference_comparison/`](inference_comparison/)
+
+Compared four combinations of quantization and serving framework at batch=8.
+
+| Method | Throughput | Speedup |
+|--------|-----------|---------|
+| HF + FP16 (Baseline) | 348 tok/s | 1.0x |
+| HF + INT4 | 172 tok/s | 0.5x |
+| vLLM + FP16 | 1,639 tok/s | **4.7x** |
+| vLLM + INT4 | 1,290 tok/s | 3.7x |
+
+**Finding**: For small models at moderate batch sizes, the bottleneck is
+scheduling, not VRAM capacity — vLLM alone provides the largest gain.
+Quantization hurts here due to dequantization overhead, but becomes
+essential for larger models that don't fit in FP16.
+
+![Inference Comparison](inference_comparison/inference_comparison.png)
 
 ---
 
 ## Setup
 ```bash
+# WSL2 / Linux (for vLLM experiments)
 pip install torch transformers accelerate bitsandbytes peft datasets vllm matplotlib seaborn
+
+# Windows (for LLaDA experiments, requires transformers==4.38.2)
+pip install torch transformers==4.38.2 accelerate matplotlib seaborn
 ```
 
-- dLLM experiments: `GSAI-ML/LLaDA-8B-Instruct` (~16GB, use `device_map="auto"` for CPU offload on 8GB VRAM)
-- Other experiments: `Qwen/Qwen2.5-0.5B-Instruct`
+**Models used**:
+- `GSAI-ML/LLaDA-8B-Instruct` — dLLM experiments (16GB, CPU offload on 8GB VRAM)
+- `Qwen/Qwen2.5-0.5B-Instruct` — compression and serving experiments
+- `Qwen/Qwen2.5-1.5B-Instruct` — knowledge distillation teacher
 
 ## Hardware
 
-NVIDIA RTX 4060 Laptop GPU (8GB VRAM), Windows 11 + WSL2 Ubuntu 24.04
+NVIDIA RTX 4060 Laptop GPU (8GB VRAM)  
+Windows 11 + WSL2 Ubuntu 24.04
 
 ## References
 
@@ -143,3 +193,5 @@ NVIDIA RTX 4060 Laptop GPU (8GB VRAM), Windows 11 + WSL2 Ubuntu 24.04
 - [Fast-dLLM V2](https://arxiv.org/abs/2503.09573): arXiv 2025
 - [Dream 7B](https://arxiv.org/abs/2502.09992): Ye et al., arXiv 2025
 - [Flash Attention](https://arxiv.org/abs/2205.14135): Dao et al., NeurIPS 2022
+- [LoRA](https://arxiv.org/abs/2106.09685): Hu et al., ICLR 2022
+- [Knowledge Distillation](https://arxiv.org/abs/1503.02531): Hinton et al., 2015
